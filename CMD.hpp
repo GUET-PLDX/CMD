@@ -8,6 +8,8 @@ constructor_args:
   - chassis_cmd_topic_name: "chassis_cmd"
   - gimbal_cmd_topic_name: "gimbal_cmd"
   - launcher_cmd_topic_name: "launcher_cmd"
+  - dispatch_task_stack_depth: 1024
+  - dispatch_thread_priority: LibXR::Thread::Priority::HIGH
 === END MANIFEST === */
 /* clang-format on */
 
@@ -18,6 +20,7 @@ constructor_args:
  */
 
 #include <array>
+#include <atomic>
 #include <cmath>
 
 #include "app_framework.hpp"
@@ -26,6 +29,8 @@ constructor_args:
 #include "message.hpp"
 #include "mpmc_queue.hpp"
 #include "mutex.hpp"
+#include "semaphore.hpp"
+#include "thread.hpp"
 
 /**
  * @class CMD
@@ -180,8 +185,9 @@ class CMD : public LibXR::Application {
       }
 
       snapshot = BuildDispatchLocked();
+      EnqueueDispatchLocked(snapshot);
     }
-    Publish(snapshot);
+    this->dispatch_ready_.Post();
   }
 
   /**
@@ -193,8 +199,9 @@ class CMD : public LibXR::Application {
       LibXR::Mutex::LockGuard lock(mutex_);
       this->data_[static_cast<size_t>(ControlSource::CTRL_SOURCE_AI)] = ai_data;
       snapshot = BuildDispatchLocked();
+      EnqueueDispatchLocked(snapshot);
     }
-    Publish(snapshot);
+    this->dispatch_ready_.Post();
   }
 
   /**
@@ -202,12 +209,16 @@ class CMD : public LibXR::Application {
    * @param hw 硬件容器引用
    * @param app 应用管理器引用
    * @param mode 控制模式，默认为操作员控制模式
-   * @param chassis_cmd_topic_name 底盘命令主题名称
-   * @param gimbal_cmd_topic_name 云台命令主题名称
+   * @param chassis_cmd_topic_name Chassis command topic name.
+   * @param gimbal_cmd_topic_name Gimbal command topic name.
+   * @param launcher_cmd_topic_name Launcher command topic name.
+   * @param dispatch_task_stack_depth Dispatcher stack size in bytes.
+   * @param dispatch_thread_priority Dispatcher thread priority.
    */
   CMD(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app, Mode mode,
       const char* chassis_cmd_topic_name, const char* gimbal_cmd_topic_name,
-      const char* launcher_cmd_topic_name)
+      const char* launcher_cmd_topic_name, uint32_t dispatch_task_stack_depth,
+      LibXR::Thread::Priority dispatch_thread_priority)
       : mode_(mode),
         chassis_data_tp_(LibXR::Topic::CreateTopic<ChassisCMD>(
             chassis_cmd_topic_name, nullptr, true)),
@@ -229,6 +240,9 @@ class CMD : public LibXR::Application {
                               callback);
     this->cmd_event_.Register(static_cast<uint32_t>(Mode::CMD_AUTO_CTRL),
                               callback);
+    this->dispatch_thread_.Create(this, DispatchTask, "CMDDispatch",
+                                  dispatch_task_stack_depth,
+                                  dispatch_thread_priority);
   }
 
   /**
@@ -238,15 +252,22 @@ class CMD : public LibXR::Application {
    */
   void SetCtrlMode(Mode mode) {
     LibXR::Mutex::LockGuard lock(mutex_);
+    this->applied_mode_request_state_ =
+        this->mode_request_state_.load(std::memory_order_acquire);
     this->mode_ = mode;
   }
 
   void RequestCtrlMode(Mode mode) {
-    if (this->mode_requests_.Push(mode) == LibXR::ErrorCode::FULL) {
-      Mode discarded_mode;
-      static_cast<void>(this->mode_requests_.Pop(discarded_mode));
-      static_cast<void>(this->mode_requests_.Push(mode));
-    }
+    const uint32_t MODE_VALUE = static_cast<uint32_t>(mode) & MODE_VALUE_MASK;
+    uint32_t expected =
+        this->mode_request_state_.load(std::memory_order_relaxed);
+    uint32_t desired;
+    do {
+      desired =
+          ((expected + MODE_SEQUENCE_STEP) & ~MODE_VALUE_MASK) | MODE_VALUE;
+    } while (!this->mode_request_state_.compare_exchange_weak(
+        expected, desired, std::memory_order_release,
+        std::memory_order_relaxed));
   }
 
   /**
@@ -274,17 +295,33 @@ class CMD : public LibXR::Application {
    */
   void OnMonitor() override {}
 
+  uint32_t GetDispatchOverflowCount() {
+    LibXR::Mutex::LockGuard lock(mutex_);
+    return this->dispatch_overflow_count_;
+  }
+
  private:
   struct DispatchSnapshot {
     ChassisCMD chassis{};
     GimbalCMD gimbal{};
     LauncherCMD launcher{};
+    uint64_t sequence = 0U;
     uint32_t event_id = 0U;
     bool has_event = false;
   };
 
+  static_assert(std::atomic<uint32_t>::is_always_lock_free);
+  static constexpr size_t DISPATCH_QUEUE_CAPACITY = 16;
+  static constexpr uint32_t MODE_VALUE_MASK = 0x1U;
+  static constexpr uint32_t MODE_SEQUENCE_STEP = MODE_VALUE_MASK + 1U;
+
   LibXR::Mutex mutex_;
-  LibXR::MPMCQueue<Mode> mode_requests_{4};
+  LibXR::MPMCQueue<DispatchSnapshot> dispatch_queue_{DISPATCH_QUEUE_CAPACITY};
+  LibXR::Semaphore dispatch_ready_;
+  LibXR::Thread dispatch_thread_;
+  std::atomic<uint32_t> mode_request_state_{0U};
+  DispatchSnapshot overflow_snapshot_{};
+  bool overflow_pending_ = false;
   bool online_ = false;    /* 在线状态 */
   Mode mode_;              /* 当前控制模式 */
   LibXR::Event cmd_event_; /* 事件处理器 */
@@ -299,8 +336,11 @@ class CMD : public LibXR::Application {
   LibXR::Topic fire_data_tp_;       /* 开火命令主题 */
   LibXR::Topic host_euler_data_tp_; /* 上位机欧拉角主题 */
   RCInputSource active_rc_input_ =
-      RCInputSource::RC_INPUT_DR16; /* 当前活动遥控输入源 */
-  uint32_t rc_update_seq_ = 0;      /* 遥控输入数据更新序号 */
+      RCInputSource::RC_INPUT_DR16;          /* 当前活动遥控输入源 */
+  uint64_t dispatch_sequence_ = 0U;          /* 命令快照序号 */
+  uint32_t dispatch_overflow_count_ = 0U;    /* 调度队列溢出计数 */
+  uint32_t applied_mode_request_state_ = 0U; /* 已应用模式请求 */
+  uint32_t rc_update_seq_ = 0;               /* 遥控输入数据更新序号 */
 
   /*--------------------------工具函数-------------------------------------------------*/
   static bool IsRCInputOnline(const Data& rc_data) {
@@ -364,15 +404,18 @@ class CMD : public LibXR::Application {
   }
 
   DispatchSnapshot BuildDispatchLocked() {
-    Mode requested_mode;
-    while (this->mode_requests_.Pop(requested_mode) == LibXR::ErrorCode::OK) {
-      this->mode_ = requested_mode;
+    const uint32_t MODE_REQUEST_STATE =
+        this->mode_request_state_.load(std::memory_order_acquire);
+    if (MODE_REQUEST_STATE != this->applied_mode_request_state_) {
+      this->mode_ = static_cast<Mode>(MODE_REQUEST_STATE & MODE_VALUE_MASK);
+      this->applied_mode_request_state_ = MODE_REQUEST_STATE;
     }
 
     const Data rc_data = this->SelectRCData();
     const Data& ai_data =
         this->data_[static_cast<size_t>(ControlSource::CTRL_SOURCE_AI)];
     DispatchSnapshot snapshot;
+    snapshot.sequence = ++this->dispatch_sequence_;
 
     this->data_[static_cast<size_t>(ControlSource::CTRL_SOURCE_RC)] = rc_data;
 
@@ -407,6 +450,55 @@ class CMD : public LibXR::Application {
     }
 
     return snapshot;
+  }
+
+  void EnqueueDispatchLocked(const DispatchSnapshot& snapshot) {
+    if (this->overflow_pending_) {
+      this->HandleDispatchOverflowLocked(snapshot);
+      return;
+    }
+
+    const LibXR::ErrorCode PUSH_RESULT = this->dispatch_queue_.Push(snapshot);
+    if (PUSH_RESULT != LibXR::ErrorCode::OK) {
+      this->HandleDispatchOverflowLocked(snapshot);
+    }
+  }
+
+  void HandleDispatchOverflowLocked(const DispatchSnapshot& snapshot) {
+    this->overflow_snapshot_ = {};
+    this->overflow_snapshot_.sequence = snapshot.sequence;
+    this->overflow_snapshot_.event_id = CMD_EVENT_LOST_CTRL;
+    this->overflow_snapshot_.has_event = true;
+    this->overflow_pending_ = true;
+    ++this->dispatch_overflow_count_;
+  }
+
+  bool TakeNextDispatch(DispatchSnapshot& snapshot) {
+    LibXR::Mutex::LockGuard lock(mutex_);
+    if (this->dispatch_queue_.Pop(snapshot) == LibXR::ErrorCode::OK) {
+      return true;
+    }
+    if (!this->overflow_pending_) {
+      return false;
+    }
+
+    snapshot = this->overflow_snapshot_;
+    this->overflow_pending_ = false;
+    this->online_ = false;
+    return true;
+  }
+
+  static void DispatchTask(CMD* cmd) {
+    uint64_t last_sequence = 0U;
+    while (true) {
+      static_cast<void>(cmd->dispatch_ready_.Wait());
+      DispatchSnapshot snapshot;
+      while (cmd->TakeNextDispatch(snapshot)) {
+        ASSERT(snapshot.sequence > last_sequence);
+        last_sequence = snapshot.sequence;
+        cmd->Publish(snapshot);
+      }
+    }
   }
 
   void Publish(const DispatchSnapshot& snapshot) {
