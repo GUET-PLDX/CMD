@@ -24,6 +24,8 @@ constructor_args:
 #include "event.hpp"
 #include "libxr_def.hpp"
 #include "message.hpp"
+#include "mpmc_queue.hpp"
+#include "mutex.hpp"
 
 /**
  * @class CMD
@@ -123,9 +125,13 @@ class CMD : public LibXR::Application {
    * @brief 获取当前控制模式
    * @return 当前控制模式
    */
-  Mode GetCtrlMode() { return this->mode_; }
+  Mode GetCtrlMode() {
+    LibXR::Mutex::LockGuard lock(mutex_);
+    return this->mode_;
+  }
 
   bool GetAIGimbalStatus() {
+    LibXR::Mutex::LockGuard lock(mutex_);
     return this->data_[static_cast<size_t>(ControlSource::CTRL_SOURCE_AI)]
         .gimbal_online;
   }
@@ -141,7 +147,10 @@ class CMD : public LibXR::Application {
    * @brief 获取在线状态
    * @return 是否在线
    */
-  bool Online() { return this->online_; }
+  bool Online() {
+    LibXR::Mutex::LockGuard lock(mutex_);
+    return this->online_;
+  }
 
   /**
    * @brief 直接写入遥控器控制数据
@@ -160,22 +169,32 @@ class CMD : public LibXR::Application {
       return;
     }
 
-    this->rc_input_data_[source_index] = rc_data;
-    this->rc_input_seq_[source_index] = ++this->rc_update_seq_;
+    DispatchSnapshot snapshot;
+    {
+      LibXR::Mutex::LockGuard lock(mutex_);
+      this->rc_input_data_[source_index] = rc_data;
+      this->rc_input_seq_[source_index] = ++this->rc_update_seq_;
 
-    if (rc_data.chassis_online && this->IsRCInputActive(rc_data)) {
-      this->active_rc_input_ = source;
+      if (rc_data.chassis_online && this->IsRCInputActive(rc_data)) {
+        this->active_rc_input_ = source;
+      }
+
+      snapshot = BuildDispatchLocked();
     }
-
-    this->ProcessAndPublish();
+    Publish(snapshot);
   }
 
   /**
    * @brief 直接写入 AI 控制数据
    */
   void FeedAI(const Data& ai_data) {
-    this->data_[static_cast<size_t>(ControlSource::CTRL_SOURCE_AI)] = ai_data;
-    this->ProcessAndPublish();
+    DispatchSnapshot snapshot;
+    {
+      LibXR::Mutex::LockGuard lock(mutex_);
+      this->data_[static_cast<size_t>(ControlSource::CTRL_SOURCE_AI)] = ai_data;
+      snapshot = BuildDispatchLocked();
+    }
+    Publish(snapshot);
   }
 
   /**
@@ -202,7 +221,7 @@ class CMD : public LibXR::Application {
     auto callback = LibXR::Callback<uint32_t>::Create(
         [](bool in_isr, CMD* cmd, uint32_t event_id) {
           UNUSED(in_isr);
-          cmd->EventHandler(event_id);
+          cmd->RequestCtrlMode(static_cast<Mode>(event_id));
         },
         this);
     /* 注册控制模式事件处理回调 */
@@ -217,7 +236,18 @@ class CMD : public LibXR::Application {
    * @param mode 要设置的控制模式
    * @details 根据不同的控制模式配置相应的数据处理回调函数
    */
-  void SetCtrlMode(Mode mode) { this->mode_ = mode; }
+  void SetCtrlMode(Mode mode) {
+    LibXR::Mutex::LockGuard lock(mutex_);
+    this->mode_ = mode;
+  }
+
+  void RequestCtrlMode(Mode mode) {
+    if (this->mode_requests_.Push(mode) == LibXR::ErrorCode::FULL) {
+      Mode discarded_mode;
+      static_cast<void>(this->mode_requests_.Pop(discarded_mode));
+      static_cast<void>(this->mode_requests_.Push(mode));
+    }
+  }
 
   /**
    * @brief 事件处理器
@@ -225,7 +255,7 @@ class CMD : public LibXR::Application {
    * @details 处理来自事件系统的控制模式切换请求
    */
   void EventHandler(uint32_t event_id) {
-    this->SetCtrlMode(static_cast<Mode>(event_id));
+    this->RequestCtrlMode(static_cast<Mode>(event_id));
   }
 
   /**
@@ -245,6 +275,16 @@ class CMD : public LibXR::Application {
   void OnMonitor() override {}
 
  private:
+  struct DispatchSnapshot {
+    ChassisCMD chassis{};
+    GimbalCMD gimbal{};
+    LauncherCMD launcher{};
+    uint32_t event_id = 0U;
+    bool has_event = false;
+  };
+
+  LibXR::Mutex mutex_;
+  LibXR::MPMCQueue<Mode> mode_requests_{4};
   bool online_ = false;    /* 在线状态 */
   Mode mode_;              /* 当前控制模式 */
   LibXR::Event cmd_event_; /* 事件处理器 */
@@ -288,18 +328,6 @@ class CMD : public LibXR::Application {
     return rc_data;
   }
 
-  void PublishSafeStopCommands() {
-    ChassisCMD chassis{};
-    chassis.self_define = ChasStat::NONE;
-    GimbalCMD gimbal{};
-    LauncherCMD launcher{};
-    launcher.isfire = false;
-
-    this->gimbal_data_tp_.Publish(gimbal);
-    this->chassis_data_tp_.Publish(chassis);
-    this->fire_data_tp_.Publish(launcher);
-  }
-
   Data SelectRCData() {
     const auto dr16_index = static_cast<size_t>(RCInputSource::RC_INPUT_DR16);
     const auto vt13_index = static_cast<size_t>(RCInputSource::RC_INPUT_VT13);
@@ -335,48 +363,61 @@ class CMD : public LibXR::Application {
     return MakeOfflineRCData();
   }
 
-  void ProcessAndPublish() {
+  DispatchSnapshot BuildDispatchLocked() {
+    Mode requested_mode;
+    while (this->mode_requests_.Pop(requested_mode) == LibXR::ErrorCode::OK) {
+      this->mode_ = requested_mode;
+    }
+
     const Data rc_data = this->SelectRCData();
     const Data& ai_data =
         this->data_[static_cast<size_t>(ControlSource::CTRL_SOURCE_AI)];
+    DispatchSnapshot snapshot;
 
     this->data_[static_cast<size_t>(ControlSource::CTRL_SOURCE_RC)] = rc_data;
 
     if (!rc_data.chassis_online && this->online_) {
-      this->cmd_event_.Active(CMD_EVENT_LOST_CTRL);
       this->online_ = false;
+      snapshot.event_id = CMD_EVENT_LOST_CTRL;
+      snapshot.has_event = true;
     } else if (rc_data.chassis_online && !this->online_) {
-      this->cmd_event_.Active(CMD_EVENT_START_CTRL);
       this->online_ = true;
+      snapshot.event_id = CMD_EVENT_START_CTRL;
+      snapshot.has_event = true;
     }
 
     /* 遥控失联时优先失能全部执行机构，禁止自动控制继续输出 */
     if (!rc_data.chassis_online) {
-      this->PublishSafeStopCommands();
-      return;
+      snapshot.chassis.self_define = ChasStat::NONE;
+      snapshot.launcher.isfire = false;
+      return snapshot;
     }
 
     if (this->mode_ == Mode::CMD_OP_CTRL) {
-      Data out = rc_data;
-      this->gimbal_data_tp_.Publish(out.gimbal);
-      this->chassis_data_tp_.Publish(out.chassis);
-      this->fire_data_tp_.Publish(out.launcher);
+      snapshot.chassis = rc_data.chassis;
+      snapshot.gimbal = rc_data.gimbal;
+      snapshot.launcher = rc_data.launcher;
     } else {
       /* CMD_AUTO_CTRL */
-      ChassisCMD out_chassis =
+      snapshot.chassis =
           ai_data.chassis_online ? ai_data.chassis : rc_data.chassis;
-      GimbalCMD out_gimbal =
-          ai_data.gimbal_online ? ai_data.gimbal : rc_data.gimbal;
-      LauncherCMD out_launcher;
-      out_launcher.isfire =
+      snapshot.gimbal = ai_data.gimbal_online ? ai_data.gimbal : rc_data.gimbal;
+      snapshot.launcher.isfire =
           (ai_data.launcher.isfire && rc_data.launcher.isfire);
+    }
 
-      ChassisCMD chassis = out_chassis;
-      GimbalCMD gimbal = out_gimbal;
-      LauncherCMD launcher = out_launcher;
-      this->gimbal_data_tp_.Publish(gimbal);
-      this->chassis_data_tp_.Publish(chassis);
-      this->fire_data_tp_.Publish(launcher);
+    return snapshot;
+  }
+
+  void Publish(const DispatchSnapshot& snapshot) {
+    GimbalCMD gimbal = snapshot.gimbal;
+    ChassisCMD chassis = snapshot.chassis;
+    LauncherCMD launcher = snapshot.launcher;
+    this->gimbal_data_tp_.Publish(gimbal);
+    this->chassis_data_tp_.Publish(chassis);
+    this->fire_data_tp_.Publish(launcher);
+    if (snapshot.has_event) {
+      this->cmd_event_.Active(snapshot.event_id);
     }
   }
 };
