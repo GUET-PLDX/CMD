@@ -23,6 +23,7 @@ constructor_args:
 #include <atomic>
 #include <cmath>
 
+#include "ChassisCommandContract.hpp"
 #include "app_framework.hpp"
 #include "event.hpp"
 #include "libxr_def.hpp"
@@ -78,10 +79,15 @@ class CMD : public LibXR::Application {
    * @brief 底盘控制命令结构体
    */
   typedef struct {
-    float x;              /* X轴方向控制量 */
-    float y;              /* Y轴方向控制量 */
-    float z;              /* Z轴方向控制量（旋转） */
-    ChasStat self_define; /* 自定义按钮 */
+    float x;                         /* X轴方向控制量 */
+    float y;                         /* Y轴方向控制量 */
+    float z;                         /* Z轴方向控制量（旋转） */
+    ChasStat self_define;            /* 自定义按钮 */
+    bool si_units = false;           /* true: base_footprint m/s, m/s, rad/s */
+    float force_x_global_n = 0.0F;   /* 全局 X 轴合力，N */
+    float force_y_global_n = 0.0F;   /* 全局 Y 轴合力，N */
+    float torque_z_global_nm = 0.0F; /* 全局 Z 轴力矩，N*m */
+    bool force_control = false;      /* true: 直接使用上述力/力矩 */
   } ChassisCMD;
 
   /**
