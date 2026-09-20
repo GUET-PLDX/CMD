@@ -23,7 +23,6 @@ constructor_args:
 #include <atomic>
 #include <cmath>
 
-#include "ChassisCommandContract.hpp"
 #include "app_framework.hpp"
 #include "event.hpp"
 #include "libxr_def.hpp"
@@ -75,19 +74,31 @@ class CMD : public LibXR::Application {
     STRETCH = 2, /*伸腿*/
   };
 
+  enum class ChassisCommandSource : uint8_t {
+    OPERATOR = 0,
+    NAVIGATION = 1,
+  };
+
+  struct OperatorChassisInput {
+    float x;
+    float y;
+    float z;
+  };
+
+  struct NavigationVelocity {
+    float vx_mps;
+    float vy_mps;
+    float wz_rad_s;
+  };
+
   /**
    * @brief 底盘控制命令结构体
    */
   typedef struct {
-    float x;                         /* X轴方向控制量 */
-    float y;                         /* Y轴方向控制量 */
-    float z;                         /* Z轴方向控制量（旋转） */
-    ChasStat self_define;            /* 自定义按钮 */
-    bool si_units = false;           /* true: base_footprint m/s, m/s, rad/s */
-    float force_x_global_n = 0.0F;   /* 全局 X 轴合力，N */
-    float force_y_global_n = 0.0F;   /* 全局 Y 轴合力，N */
-    float torque_z_global_nm = 0.0F; /* 全局 Z 轴力矩，N*m */
-    bool force_control = false;      /* true: 直接使用上述力/力矩 */
+    ChassisCommandSource source;
+    OperatorChassisInput operator_input;
+    NavigationVelocity navigation_velocity;
+    ChasStat self_define; /* 自定义按钮 */
   } ChassisCMD;
 
   /**
@@ -356,9 +367,9 @@ class CMD : public LibXR::Application {
   static bool IsRCInputActive(const Data& rc_data) {
     constexpr float RC_ACTIVITY_EPS = 0.05f;
 
-    return std::fabs(rc_data.chassis.x) > RC_ACTIVITY_EPS ||
-           std::fabs(rc_data.chassis.y) > RC_ACTIVITY_EPS ||
-           std::fabs(rc_data.chassis.z) > RC_ACTIVITY_EPS ||
+    return std::fabs(rc_data.chassis.operator_input.x) > RC_ACTIVITY_EPS ||
+           std::fabs(rc_data.chassis.operator_input.y) > RC_ACTIVITY_EPS ||
+           std::fabs(rc_data.chassis.operator_input.z) > RC_ACTIVITY_EPS ||
            std::fabs(rc_data.gimbal.yaw) > RC_ACTIVITY_EPS ||
            std::fabs(rc_data.gimbal.pit) > RC_ACTIVITY_EPS ||
            std::fabs(rc_data.gimbal.rol) > RC_ACTIVITY_EPS ||
@@ -437,19 +448,26 @@ class CMD : public LibXR::Application {
 
     /* 遥控失联时优先失能全部执行机构，禁止自动控制继续输出 */
     if (!rc_data.chassis_online) {
-      snapshot.chassis.self_define = ChasStat::NONE;
+      snapshot.chassis = {};
+      snapshot.chassis.source = ChassisCommandSource::OPERATOR;
       snapshot.launcher.isfire = false;
       return snapshot;
     }
 
     if (this->mode_ == Mode::CMD_OP_CTRL) {
       snapshot.chassis = rc_data.chassis;
+      snapshot.chassis.source = ChassisCommandSource::OPERATOR;
       snapshot.gimbal = rc_data.gimbal;
       snapshot.launcher = rc_data.launcher;
     } else {
       /* CMD_AUTO_CTRL */
-      snapshot.chassis =
-          ai_data.chassis_online ? ai_data.chassis : rc_data.chassis;
+      if (ai_data.chassis_online) {
+        snapshot.chassis = ai_data.chassis;
+        snapshot.chassis.source = ChassisCommandSource::NAVIGATION;
+      } else {
+        snapshot.chassis = rc_data.chassis;
+        snapshot.chassis.source = ChassisCommandSource::OPERATOR;
+      }
       snapshot.gimbal = ai_data.gimbal_online ? ai_data.gimbal : rc_data.gimbal;
       snapshot.launcher.isfire =
           (ai_data.launcher.isfire && rc_data.launcher.isfire);

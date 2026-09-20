@@ -30,9 +30,10 @@ forbid_file_text() {
 
 extract_block() {
   local start_pattern=$1
+  start_pattern=${start_pattern//\\/}
   awk -v start_pattern="$start_pattern" '
     { sub(/\r$/, "") }
-    $0 ~ start_pattern { active = 1 }
+    index($0, start_pattern) { active = 1 }
     active {
       print
       opens = gsub(/{/, "{")
@@ -98,6 +99,23 @@ require_file_text 'dispatch_task_stack_depth' \
   'missing: dispatch task stack constructor suffix'
 require_file_text 'dispatch_thread_priority' \
   'missing: dispatch task priority constructor suffix'
+require_file_text 'enum class ChassisCommandSource : uint8_t {' \
+  'missing: chassis command source contract'
+require_file_text 'OPERATOR = 0' 'missing: operator chassis command source'
+require_file_text 'NAVIGATION = 1' 'missing: navigation chassis command source'
+require_file_text 'struct OperatorChassisInput {' \
+  'missing: operator chassis input contract'
+require_file_text 'struct NavigationVelocity {' \
+  'missing: navigation velocity contract'
+require_file_text 'OperatorChassisInput operator_input;' \
+  'missing: operator input in ChassisCMD'
+require_file_text 'NavigationVelocity navigation_velocity;' \
+  'missing: navigation velocity in ChassisCMD'
+require_file_text 'ChassisCommandSource source;' \
+  'missing: source field in ChassisCMD'
+forbid_file_text 'si_units' 'ChassisCMD must not depend on si_units'
+forbid_file_text 'NormalizedSpeed' \
+  'ChassisCMD must not use the legacy normalized speed type'
 
 feed_rc_default=$(extract_block 'void FeedRC\(const Data&')
 feed_rc_source=$(extract_block 'void FeedRC\(RCInputSource')
@@ -169,6 +187,18 @@ require_block_text "$build_dispatch" 'mode_request_state_.load' \
 
 require_block_text "$build_dispatch" 'snapshot.sequence = ++this->dispatch_sequence_;' \
   'BuildDispatchLocked must assign a monotonic dispatch sequence'
+require_block_text "$build_dispatch" 'snapshot.chassis = {};' \
+  'offline RC must publish a complete zero chassis command'
+require_block_text "$build_dispatch" \
+  'snapshot.chassis.source = ChassisCommandSource::OPERATOR;' \
+  'offline and operator commands must identify the operator source'
+require_block_text "$build_dispatch" 'snapshot.chassis = rc_data.chassis;' \
+  'operator mode must select the complete RC chassis command'
+require_block_text "$build_dispatch" 'snapshot.chassis = ai_data.chassis;' \
+  'automatic mode must select the complete navigation chassis command'
+require_block_text "$build_dispatch" \
+  'snapshot.chassis.source = ChassisCommandSource::NAVIGATION;' \
+  'automatic navigation commands must identify their source'
 forbid_block_text "$build_dispatch" '.Publish(' \
   'BuildDispatchLocked must not publish topics'
 forbid_block_text "$build_dispatch" 'cmd_event_.Active(' \
