@@ -26,11 +26,13 @@ constructor_args:
 #include "app_framework.hpp"
 #include "event.hpp"
 #include "libxr_def.hpp"
+#include "libxr_time.hpp"
 #include "message.hpp"
 #include "mpmc_queue.hpp"
 #include "mutex.hpp"
 #include "semaphore.hpp"
 #include "thread.hpp"
+#include "timebase.hpp"
 
 /**
  * @class CMD
@@ -105,15 +107,15 @@ class CMD : public LibXR::Application {
    * @brief 云台控制命令结构体
    */
   typedef struct {
-    float yaw;      /* 偏航角（Yaw angle） */
-    float pit;      /* 俯仰角（Pitch angle） */
-    float rol;      /* 翻滚角（Roll angle） */
-    float yaw_dot;  /* yaw角速度 */
-    float yaw_ddot; /* yaw角加速度 */
-    float pit_dot;  /* pit角速度 */
-    float pit_ddot; /* pit角加速度 */
-    float rol_dot;  /* roll角速度 */
-    float rol_ddot; /* roll角加速度 */
+    float yaw;      /* 偏航角设定值，单位 rad */
+    float pit;      /* 俯仰角设定值，单位 rad */
+    float rol;      /* 翻滚角设定值，单位 rad */
+    float yaw_dot;  /* yaw 角速度，单位 rad/s */
+    float yaw_ddot; /* yaw 角加速度，单位 rad/s^2 */
+    float pit_dot;  /* pit 角速度，单位 rad/s */
+    float pit_ddot; /* pit 角加速度，单位 rad/s^2 */
+    float rol_dot;  /* roll 角速度，单位 rad/s */
+    float rol_ddot; /* roll 角加速度，单位 rad/s^2 */
   } GimbalCMD;
 
   /**
@@ -156,6 +158,12 @@ class CMD : public LibXR::Application {
     LibXR::Mutex::LockGuard lock(mutex_);
     return this->data_[static_cast<size_t>(ControlSource::CTRL_SOURCE_AI)]
         .gimbal_online;
+  }
+
+  void SetGimbalSetpoint(float yaw_rad, float pit_rad) {
+    LibXR::Mutex::LockGuard lock(mutex_);
+    this->gimbal_yaw_rad_ = yaw_rad;
+    this->gimbal_pit_rad_ = pit_rad;
   }
 
   /**
@@ -358,6 +366,13 @@ class CMD : public LibXR::Application {
   uint32_t dispatch_overflow_count_ = 0U;    /* 调度队列溢出计数 */
   uint32_t applied_mode_request_state_ = 0U; /* 已应用模式请求 */
   uint32_t rc_update_seq_ = 0;               /* 遥控输入数据更新序号 */
+  float gimbal_yaw_rad_ = 0.0f;
+  float gimbal_pit_rad_ = 0.0f;
+  LibXR::MicrosecondTimestamp last_gimbal_integrate_time_{};
+
+  static constexpr float GIMBAL_MAX_SPEED =
+      static_cast<float>(LibXR::TWO_PI) * 2.0f;
+  static constexpr float GIMBAL_INTEGRATE_MAX_DT_S = 0.05f;
 
   /*--------------------------工具函数-------------------------------------------------*/
   static bool IsRCInputOnline(const Data& rc_data) {
@@ -451,29 +466,66 @@ class CMD : public LibXR::Application {
       snapshot.chassis = {};
       snapshot.chassis.source = ChassisCommandSource::OPERATOR;
       snapshot.launcher.isfire = false;
+      snapshot.gimbal.yaw = this->gimbal_yaw_rad_;
+      snapshot.gimbal.pit = this->gimbal_pit_rad_;
       return snapshot;
     }
 
     if (this->mode_ == Mode::CMD_OP_CTRL) {
       snapshot.chassis = rc_data.chassis;
       snapshot.chassis.source = ChassisCommandSource::OPERATOR;
-      snapshot.gimbal = rc_data.gimbal;
       snapshot.launcher = rc_data.launcher;
     } else {
       /* CMD_AUTO_CTRL */
       if (ai_data.chassis_online) {
         snapshot.chassis = ai_data.chassis;
         snapshot.chassis.source = ChassisCommandSource::NAVIGATION;
+        /* 主机在线：射击需主机与遥控同时请求 */
+        snapshot.launcher.isfire =
+            (ai_data.launcher.isfire && rc_data.launcher.isfire);
       } else {
         snapshot.chassis = rc_data.chassis;
         snapshot.chassis.source = ChassisCommandSource::OPERATOR;
+        /* 主机离线：退回遥控射击请求，与底盘的离线回退一致 */
+        snapshot.launcher = rc_data.launcher;
       }
-      snapshot.gimbal = ai_data.gimbal_online ? ai_data.gimbal : rc_data.gimbal;
-      snapshot.launcher.isfire =
-          (ai_data.launcher.isfire && rc_data.launcher.isfire);
     }
+    this->ApplyGimbalCommandLocked(snapshot, rc_data, ai_data);
 
     return snapshot;
+  }
+
+  void ApplyGimbalCommandLocked(DispatchSnapshot& snapshot, const Data& rc_data,
+                                const Data& ai_data) {
+    const auto NOW = LibXR::Timebase::GetMicroseconds();
+    float dt_s = 0.0f;
+    if (static_cast<uint64_t>(this->last_gimbal_integrate_time_) != 0U) {
+      dt_s = (NOW - this->last_gimbal_integrate_time_).ToSecondf();
+    }
+    this->last_gimbal_integrate_time_ = NOW;
+    if (!std::isfinite(dt_s) || dt_s < 0.0f ||
+        dt_s > GIMBAL_INTEGRATE_MAX_DT_S) {
+      dt_s = 0.0f;
+    }
+
+    const bool USE_AI_GIMBAL =
+        this->mode_ == Mode::CMD_AUTO_CTRL && ai_data.gimbal_online;
+    if (USE_AI_GIMBAL) {
+      snapshot.gimbal = ai_data.gimbal;
+      this->gimbal_yaw_rad_ = ai_data.gimbal.yaw;
+      this->gimbal_pit_rad_ = ai_data.gimbal.pit;
+      return;
+    }
+
+    this->gimbal_yaw_rad_ += rc_data.gimbal.yaw * GIMBAL_MAX_SPEED * dt_s;
+    this->gimbal_pit_rad_ += rc_data.gimbal.pit * GIMBAL_MAX_SPEED * dt_s;
+    snapshot.gimbal = rc_data.gimbal;
+    snapshot.gimbal.yaw = this->gimbal_yaw_rad_;
+    snapshot.gimbal.pit = this->gimbal_pit_rad_;
+    snapshot.gimbal.yaw_dot = rc_data.gimbal.yaw * GIMBAL_MAX_SPEED;
+    snapshot.gimbal.pit_dot = rc_data.gimbal.pit * GIMBAL_MAX_SPEED;
+    snapshot.gimbal.yaw_ddot = 0.0f;
+    snapshot.gimbal.pit_ddot = 0.0f;
   }
 
   void EnqueueDispatchLocked(const DispatchSnapshot& snapshot) {
