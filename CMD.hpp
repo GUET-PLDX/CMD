@@ -473,15 +473,15 @@ class CMD {
       if (ai_data.chassis_online) {
         snapshot.chassis = ai_data.chassis;
         snapshot.chassis.source = ChassisCommandSource::NAVIGATION;
-        /* 主机在线：射击需主机与遥控同时请求 */
-        snapshot.launcher.isfire =
-            (ai_data.launcher.isfire && rc_data.launcher.isfire);
       } else {
         snapshot.chassis = rc_data.chassis;
         snapshot.chassis.source = ChassisCommandSource::OPERATOR;
-        /* 主机离线：退回遥控射击请求，与底盘的离线回退一致 */
-        snapshot.launcher = rc_data.launcher;
       }
+      // Vision and navigation have independent lifetimes. In automatic mode,
+      // firing requires a live vision target plus both fire requests.
+      snapshot.launcher.isfire = ai_data.gimbal_online &&
+                                 ai_data.launcher.isfire &&
+                                 rc_data.launcher.isfire;
     }
     this->ApplyGimbalCommandLocked(snapshot, rc_data, ai_data);
 
