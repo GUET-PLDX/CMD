@@ -3,13 +3,7 @@
 /* clang-format off */
 /* === MODULE MANIFEST V2 ===
 module_description: 控制命令模块
-constructor_args:
-  - mode: CMD::Mode::CMD_OP_CTRL
-  - chassis_cmd_topic_name: "chassis_cmd"
-  - gimbal_cmd_topic_name: "gimbal_cmd"
-  - launcher_cmd_topic_name: "launcher_cmd"
-  - dispatch_task_stack_depth: 1024
-  - dispatch_thread_priority: LibXR::Thread::Priority::HIGH
+depends: []
 === END MANIFEST === */
 /* clang-format on */
 
@@ -23,8 +17,8 @@ constructor_args:
 #include <atomic>
 #include <cmath>
 
-#include "app_framework.hpp"
 #include "event.hpp"
+#include "libxr.hpp"
 #include "libxr_def.hpp"
 #include "libxr_time.hpp"
 #include "message.hpp"
@@ -39,7 +33,7 @@ constructor_args:
  * @brief 控制命令处理类
  * @details 接收来自不同控制源的命令，处理并转发到底盘和云台等执行单元
  */
-class CMD : public LibXR::Application {
+class CMD {
  public:
   /**
    * @brief 控制源枚举
@@ -231,8 +225,6 @@ class CMD : public LibXR::Application {
 
   /**
    * @brief CMD构造函数
-   * @param hw 硬件容器引用
-   * @param app 应用管理器引用
    * @param mode 控制模式，默认为操作员控制模式
    * @param chassis_cmd_topic_name Chassis command topic name.
    * @param gimbal_cmd_topic_name Gimbal command topic name.
@@ -240,9 +232,9 @@ class CMD : public LibXR::Application {
    * @param dispatch_task_stack_depth Dispatcher stack size in bytes.
    * @param dispatch_thread_priority Dispatcher thread priority.
    */
-  CMD(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app, Mode mode,
-      const char* chassis_cmd_topic_name, const char* gimbal_cmd_topic_name,
-      const char* launcher_cmd_topic_name, uint32_t dispatch_task_stack_depth,
+  CMD(Mode mode, const char* chassis_cmd_topic_name,
+      const char* gimbal_cmd_topic_name, const char* launcher_cmd_topic_name,
+      uint32_t dispatch_task_stack_depth,
       LibXR::Thread::Priority dispatch_thread_priority)
       : mode_(mode),
         chassis_data_tp_(LibXR::Topic::CreateTopic<ChassisCMD>(
@@ -251,8 +243,6 @@ class CMD : public LibXR::Application {
             gimbal_cmd_topic_name, nullptr, true)),
         fire_data_tp_(LibXR::Topic::CreateTopic<LauncherCMD>(
             launcher_cmd_topic_name, nullptr, true)) {
-    UNUSED(hw);
-    UNUSED(app);
     /* 创建事件回调函数 */
     auto callback = LibXR::Callback<uint32_t>::Create(
         [](bool in_isr, CMD* cmd, uint32_t event_id) {
@@ -318,7 +308,7 @@ class CMD : public LibXR::Application {
   /**
    * @brief 监控函数重写
    */
-  void OnMonitor() override {}
+  void OnMonitor() {}
 
   uint32_t GetDispatchOverflowCount() {
     LibXR::Mutex::LockGuard lock(mutex_);
