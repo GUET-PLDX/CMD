@@ -87,6 +87,16 @@ class CMD {
     float wz_rad_s;
   };
 
+  /* 导航主机给出的驱动力前馈（与 NavigationVelocity 同一坐标系），
+   * 经 topic "chassis_ff" 由 HostDataLink → DualBoard → Omni 传递；
+   * Omni 只在导航来源、数据新鲜时把它叠加到速度 PID 输出的力上。 */
+  struct NavigationFeedforward {
+    float fx_n = 0.0F;
+    float fy_n = 0.0F;
+    float mz_nm = 0.0F;
+    bool valid = false;
+  };
+
   /**
    * @brief 底盘控制命令结构体
    */
