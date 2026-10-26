@@ -87,6 +87,16 @@ class CMD {
     float wz_rad_s;
   };
 
+  /* 导航主机给出的驱动力前馈（与 NavigationVelocity 同一坐标系），
+   * 经 topic "chassis_ff" 由 HostDataLink → DualBoard → Omni 传递；
+   * Omni 只在导航来源、数据新鲜时把它叠加到速度 PID 输出的力上。 */
+  struct NavigationFeedforward {
+    float fx_n = 0.0F;
+    float fy_n = 0.0F;
+    float mz_nm = 0.0F;
+    bool valid = false;
+  };
+
   /**
    * @brief 底盘控制命令结构体
    */
@@ -99,10 +109,12 @@ class CMD {
 
   /**
    * @brief 云台控制命令结构体
+   * @details 遥控 yaw/pit 为归一化输入，由云台按控制周期积分；
+   *          AI yaw/pit 为绝对角，导数使用 rad/s 和 rad/s^2。
    */
   typedef struct {
-    float yaw;      /* 偏航角设定值，单位 rad */
-    float pit;      /* 俯仰角设定值，单位 rad */
+    float yaw;      /* 遥控归一化输入 / AI 偏航角 rad */
+    float pit;      /* 遥控归一化输入 / AI 俯仰角 rad */
     float rol;      /* 翻滚角设定值，单位 rad */
     float yaw_dot;  /* yaw 角速度，单位 rad/s */
     float yaw_ddot; /* yaw 角加速度，单位 rad/s^2 */
@@ -152,12 +164,6 @@ class CMD {
     LibXR::Mutex::LockGuard lock(mutex_);
     return this->data_[static_cast<size_t>(ControlSource::CTRL_SOURCE_AI)]
         .gimbal_online;
-  }
-
-  void SetGimbalSetpoint(float yaw_rad, float pit_rad) {
-    LibXR::Mutex::LockGuard lock(mutex_);
-    this->gimbal_yaw_rad_ = yaw_rad;
-    this->gimbal_pit_rad_ = pit_rad;
   }
 
   /**
@@ -232,10 +238,13 @@ class CMD {
    * @param dispatch_task_stack_depth Dispatcher stack size in bytes.
    * @param dispatch_thread_priority Dispatcher thread priority.
    */
-  CMD(Mode mode, const char* chassis_cmd_topic_name,
-      const char* gimbal_cmd_topic_name, const char* launcher_cmd_topic_name,
-      uint32_t dispatch_task_stack_depth,
-      LibXR::Thread::Priority dispatch_thread_priority)
+  CMD(Mode mode = CMD::Mode::CMD_OP_CTRL,
+      const char* chassis_cmd_topic_name = "chassis_cmd",
+      const char* gimbal_cmd_topic_name = "gimbal_cmd",
+      const char* launcher_cmd_topic_name = "launcher_cmd",
+      uint32_t dispatch_task_stack_depth = 1024,
+      LibXR::Thread::Priority dispatch_thread_priority =
+          LibXR::Thread::Priority::HIGH)
       : mode_(mode),
         chassis_data_tp_(LibXR::Topic::CreateTopic<ChassisCMD>(
             chassis_cmd_topic_name, nullptr, true)),
@@ -356,14 +365,6 @@ class CMD {
   uint32_t dispatch_overflow_count_ = 0U;    /* 调度队列溢出计数 */
   uint32_t applied_mode_request_state_ = 0U; /* 已应用模式请求 */
   uint32_t rc_update_seq_ = 0;               /* 遥控输入数据更新序号 */
-  float gimbal_yaw_rad_ = 0.0f;
-  float gimbal_pit_rad_ = 0.0f;
-  LibXR::MicrosecondTimestamp last_gimbal_integrate_time_{};
-
-  static constexpr float GIMBAL_MAX_SPEED =
-      static_cast<float>(LibXR::TWO_PI) * 2.0f;
-  static constexpr float GIMBAL_INTEGRATE_MAX_DT_S = 0.05f;
-
   /*--------------------------工具函数-------------------------------------------------*/
   static bool IsRCInputOnline(const Data& rc_data) {
     return rc_data.chassis_online;
@@ -456,8 +457,7 @@ class CMD {
       snapshot.chassis = {};
       snapshot.chassis.source = ChassisCommandSource::OPERATOR;
       snapshot.launcher.isfire = false;
-      snapshot.gimbal.yaw = this->gimbal_yaw_rad_;
-      snapshot.gimbal.pit = this->gimbal_pit_rad_;
+      snapshot.gimbal = rc_data.gimbal;
       return snapshot;
     }
 
@@ -465,57 +465,24 @@ class CMD {
       snapshot.chassis = rc_data.chassis;
       snapshot.chassis.source = ChassisCommandSource::OPERATOR;
       snapshot.launcher = rc_data.launcher;
+      snapshot.gimbal = rc_data.gimbal;
     } else {
       /* CMD_AUTO_CTRL */
+      snapshot.gimbal = ai_data.gimbal_online ? ai_data.gimbal : rc_data.gimbal;
       if (ai_data.chassis_online) {
         snapshot.chassis = ai_data.chassis;
         snapshot.chassis.source = ChassisCommandSource::NAVIGATION;
-        /* 主机在线：射击需主机与遥控同时请求 */
-        snapshot.launcher.isfire =
-            (ai_data.launcher.isfire && rc_data.launcher.isfire);
       } else {
         snapshot.chassis = rc_data.chassis;
         snapshot.chassis.source = ChassisCommandSource::OPERATOR;
-        /* 主机离线：退回遥控射击请求，与底盘的离线回退一致 */
-        snapshot.launcher = rc_data.launcher;
       }
+      // Vision and navigation have independent lifetimes. In automatic mode,
+      // firing requires a live vision target plus both fire requests.
+      snapshot.launcher.isfire = ai_data.gimbal_online &&
+                                 ai_data.launcher.isfire &&
+                                 rc_data.launcher.isfire;
     }
-    this->ApplyGimbalCommandLocked(snapshot, rc_data, ai_data);
-
     return snapshot;
-  }
-
-  void ApplyGimbalCommandLocked(DispatchSnapshot& snapshot, const Data& rc_data,
-                                const Data& ai_data) {
-    const auto NOW = LibXR::Timebase::GetMicroseconds();
-    float dt_s = 0.0f;
-    if (static_cast<uint64_t>(this->last_gimbal_integrate_time_) != 0U) {
-      dt_s = (NOW - this->last_gimbal_integrate_time_).ToSecondf();
-    }
-    this->last_gimbal_integrate_time_ = NOW;
-    if (!std::isfinite(dt_s) || dt_s < 0.0f ||
-        dt_s > GIMBAL_INTEGRATE_MAX_DT_S) {
-      dt_s = 0.0f;
-    }
-
-    const bool USE_AI_GIMBAL =
-        this->mode_ == Mode::CMD_AUTO_CTRL && ai_data.gimbal_online;
-    if (USE_AI_GIMBAL) {
-      snapshot.gimbal = ai_data.gimbal;
-      this->gimbal_yaw_rad_ = ai_data.gimbal.yaw;
-      this->gimbal_pit_rad_ = ai_data.gimbal.pit;
-      return;
-    }
-
-    this->gimbal_yaw_rad_ += rc_data.gimbal.yaw * GIMBAL_MAX_SPEED * dt_s;
-    this->gimbal_pit_rad_ += rc_data.gimbal.pit * GIMBAL_MAX_SPEED * dt_s;
-    snapshot.gimbal = rc_data.gimbal;
-    snapshot.gimbal.yaw = this->gimbal_yaw_rad_;
-    snapshot.gimbal.pit = this->gimbal_pit_rad_;
-    snapshot.gimbal.yaw_dot = rc_data.gimbal.yaw * GIMBAL_MAX_SPEED;
-    snapshot.gimbal.pit_dot = rc_data.gimbal.pit * GIMBAL_MAX_SPEED;
-    snapshot.gimbal.yaw_ddot = 0.0f;
-    snapshot.gimbal.pit_ddot = 0.0f;
   }
 
   void EnqueueDispatchLocked(const DispatchSnapshot& snapshot) {
