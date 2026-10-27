@@ -81,15 +81,13 @@ class CMD {
     float z;
   };
 
-  struct NavigationVelocity {
+  struct ChassisVelocity {
     float vx_mps;
     float vy_mps;
     float wz_rad_s;
   };
 
-  /* 导航主机给出的驱动力前馈（与 NavigationVelocity 同一坐标系），
-   * 经 topic "chassis_ff" 由 HostDataLink → DualBoard → Omni 传递；
-   * Omni 只在导航来源、数据新鲜时把它叠加到速度 PID 输出的力上。 */
+  /* Chassis-frame MPC drive wrench, carried by chassis_ff through DualBoard. */
   struct NavigationFeedforward {
     float fx_n = 0.0F;
     float fy_n = 0.0F;
@@ -103,7 +101,6 @@ class CMD {
   typedef struct {
     ChassisCommandSource source;
     OperatorChassisInput operator_input;
-    NavigationVelocity navigation_velocity;
     ChasStat self_define; /* 自定义按钮 */
   } ChassisCMD;
 
