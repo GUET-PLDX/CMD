@@ -1,83 +1,28 @@
 # CMD
 
-用于统一汇总控制输入并发布控制命令的中枢模块。
+控制命令中枢：所有输入、模式切换、查询和仲裁均由同一任务顺序执行，内部使用普通成员，不创建线程、定时器或异步队列。
 
-CMD 把不同来源（例如遥控、上位机）统一整理为三路命令：
+- 遥控源独立保存 DR16、VT13、Referee 数据；活动源在线则保留，另一在线源有操作时接管，活动源失联时回退。
+- 全部遥控离线时清零底盘、禁止开火；先更新 `Online()` 再触发控制上线/失联事件。
+- 自动模式按底盘、云台各自的 AI 在线状态选择输入。开火必须同时满足视觉在线、AI 请求、遥控许可。
+- 手动及 AI 底盘离线回退时，清零 `fx_n/fy_n/mz_nm` 并设置 `ff_valid = false`。
+- 手动云台使用归一化量；AI 使用 rad、rad/s、rad/s²。底盘力前馈单位为 N、N、N·m。
 
-1. 底盘命令
-2. 云台命令
-3. 发射命令
+`FeedRC()`、`FeedAIChassis()`、`FeedAIGimbal()`、`SetCtrlMode()` 立即更新成员，随后 getter 返回最新值。单独调用会同步仲裁发布；无效或重复模式不发布。`ApplyRCFrame()` 将一帧数据与绑定事件合并，`ApplyInput()` 支持需要先处理切换事件的输入。`UpdateInputs()` 在一个同步作用域内执行所有已注册输入回调，有变更时在返回前发布一组输出，避免同帧和同周期中间状态。输入作用域中的 getter 反映已经应用的数据；最终输出在最外层作用域结束时生成。
 
-## 解决什么问题
+构造参数依次为 `mode`、`chassis_cmd_topic_name`、`gimbal_cmd_topic_name`、`launcher_cmd_topic_name`、`control_state_topic_name`。四个 Topic 默认名称及类型：
 
-CMD 主要解决三件事：
+| Topic | 类型 | 用途 |
+| --- | --- | --- |
+| `chassis_cmd` | `CMD::ChassisCMD` | 底盘运动与力前馈 |
+| `gimbal_cmd` | `CMD::GimbalCMD` | 云台参考 |
+| `launcher_cmd` | `CMD::LauncherCMD` | 开火许可 |
+| `control_state` | `CMD::ChassisControl` | 同次仲裁的底盘命令、模式、RC/AI 底盘在线信息 |
 
-1. 统一控制源输入接口（`FeedRC` / `FeedAI`）。
-2. 统一控制模式切换（操作手/自动等）。
-3. 统一命令发布出口（下游模块只订阅 Topic，不关心输入来源）。操作手云台摇杆在 CMD 内积分为绝对角后写入 `gimbal_cmd`；自瞄轨迹原样转发。
+输入模块在构造期 `RegisterInput()`；默认 `OnMonitor()` 调用 `UpdateInputs()`。本工程 Gimbal 调用 `UseExternalRunner()` 后由其 1 ms 控制任务独占执行 `UpdateInputs()`，CMD 的监控钩子不再执行输入。Gimbal 首次监控钩子在全部模块构造与绑定完成后释放启动门。
 
-## 核心流程
+通信线程只在源模块内缓存数据，释放交接锁后由所属任务提交 CMD。DR16/VT13 使用 `CMD.hpp` 中的 `ControlInbox` 交接带时间戳的原始帧；缓存满时报告一次中断，所属任务先失能，随后新帧恢复，无需重启。停止请求在同一周期内不得被后续开火请求覆盖。
 
-CMD 的典型流程是：
+运行约束：只允许一个 runner；模式事件必须来自该任务，禁止 ISR 访问 CMD。输出和控制状态事件回调可查询 CMD，不可重入写入。输入回调仅在初始化时注册；模块和 CMD 须具有应用全生命周期，当前接口不支持动态注销销毁。
 
-1. 输入模块调用 `FeedRC(...)` 或 `FeedAI(...)`。
-2. CMD 内部执行 `ProcessAndPublish()`。
-3. 发布 `chassis_cmd`、`gimbal_cmd`、`launcher_cmd`。
-4. 底盘/云台/发射模块各自订阅并执行。
-
-关键函数：
-
-1. `FeedRC(const Data&)`：喂入遥控控制数据。
-2. `FeedAI(const Data&)`：喂入上位机/自动控制数据。
-3. `SetCtrlMode(Mode)`：切换控制模式。
-4. `EventHandler(uint32_t)`：响应外部事件切换模式。
-5. `ProcessAndPublish()`：统一整理并发布命令。
-6. `GetEvent()`：提供事件绑定入口给 EventBinder 等模块使用。
-
-## 最小接入示例
-
-1. 添加模块：
-
-```bash
-xrobot_add_mod CMD --instance-id cmd
-xrobot_gen_main
-```
-
-2. 典型配置（来自模块 manifest）：
-
-```yaml
-module: CMD
-entry_header: Modules/CMD/CMD.hpp
-constructor_args:
-  - mode: CMD::Mode::CMD_OP_CTRL
-  - chassis_cmd_topic_name: "chassis_cmd"
-  - gimbal_cmd_topic_name: "gimbal_cmd"
-  - launcher_cmd_topic_name: "launcher_cmd"
-template_args: []
-```
-
-3. 下游模块只需订阅对应命令 Topic。
-
-## 使用约定
-
-1. 推荐先初始化 CMD，再初始化依赖它的控制模块。
-2. 控制源切换尽量都走 CMD 的 `SetCtrlMode` / 事件入口。
-3. 不同来源数据结构最终都转换成 `CMD::Data` 再进入 CMD。
-
-## 模块信息
-
-1. 代码入口：`Modules/CMD/CMD.hpp`
-2. Required Hardware：None
-3. Constructor Arguments：
-   - `mode`
-   - `chassis_cmd_topic_name`
-   - `gimbal_cmd_topic_name`
-   - `launcher_cmd_topic_name`
-4. Template Arguments：None
-5. Depends：None
-
-## LibXR 2.0 静态装配
-
-使用 xrobot 1.0.1 的 `module` / 有序 `args`；构造函数显式注入外设与服务，实例按依赖顺序创建。参数名和顺序以头文件中的构造函数为准，固件示例见 `User/RobotConfig/`。
-
-保留 PLDX 控制、协议、超时与离线保护。 `OnMonitor()` 由生成的监控循环直接调用。
+完整验收：`python3 tools/tests/run_control_acceptance.py --firmware`。集成说明见根工程 `docs/control-acceptance.md`。
