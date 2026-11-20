@@ -254,22 +254,24 @@ class CMD {
   }
 
  private:
-  bool online_ = false;
   Mode mode_;
-  LibXR::Event cmd_event_; /* 事件处理器 */
+  bool online_ = false;
+  RCInputSource active_rc_input_ =
+      RCInputSource::RC_INPUT_DR16; /* 当前活动遥控输入源 */
+  uint32_t rc_update_seq_ = 0;      /* 遥控输入数据更新序号 */
+
   std::array<Data, static_cast<size_t>(ControlSource::CTRL_SOURCE_NUM)>
       data_{}; /* 各控制源的数据 */
   std::array<Data, static_cast<size_t>(RCInputSource::RC_INPUT_NUM)>
       rc_input_data_{}; /* 各遥控输入源的数据 */
   std::array<uint32_t, static_cast<size_t>(RCInputSource::RC_INPUT_NUM)>
       rc_input_seq_{};           /* 各遥控输入源的数据序号 */
+
+  LibXR::Event cmd_event_; /* 事件处理器 */
   LibXR::Topic chassis_data_tp_; /* 底盘命令主题 */
   LibXR::Topic gimbal_data_tp_;  /* 云台命令主题 */
   LibXR::Topic fire_data_tp_;    /* 开火命令主题 */
   LibXR::Topic control_state_tp_;
-  RCInputSource active_rc_input_ =
-      RCInputSource::RC_INPUT_DR16; /* 当前活动遥控输入源 */
-  uint32_t rc_update_seq_ = 0;      /* 遥控输入数据更新序号 */
   /*--------------------------工具函数-------------------------------------------------*/
   static bool IsRCInputOnline(const Data& rc_data) {
     return rc_data.chassis_online;
