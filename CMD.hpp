@@ -14,6 +14,7 @@ depends: []
  */
 
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 
@@ -33,6 +34,28 @@ struct LifterFeedback {
 
 inline constexpr char LIFTER_TARGET_TOPIC[] = "lifter_target";
 inline constexpr char LIFTER_FEEDBACK_TOPIC[] = "lifter_feedback";
+
+enum class FoldAction : uint8_t { RELEASE, HOLD, TOP, BOTTOM };
+
+struct ConfigurationFoldCommand {
+  FoldAction action = FoldAction::RELEASE;
+  uint32_t stamp_ms = 0U;
+  uint32_t control_revision = 0U;
+};
+
+struct ConfigurationFeedback {
+  LifterPosition position = LifterPosition::MIDDLE;
+  float yaw_rad = 0.0F;
+  bool fold_valid = false;
+  bool yaw_valid = false;
+  uint64_t fold_sample_us = 0U;
+  uint64_t yaw_sample_us = 0U;
+};
+
+inline constexpr char CONFIGURATION_FOLD_COMMAND_TOPIC[] =
+    "configuration_fold_command";
+inline constexpr char CONFIGURATION_FEEDBACK_TOPIC[] = "configuration_feedback";
+inline constexpr uint32_t CONFIGURATION_COMMAND_TIMEOUT_MS = 100U;
 
 }
 
@@ -68,6 +91,11 @@ class CMD {
   enum class Mode : uint8_t {
     CMD_OP_CTRL,   /* 操作员控制模式 */
     CMD_AUTO_CTRL, /* 自动控制模式 */
+  };
+
+  struct ControlSelection {
+    Mode mode;
+    uint32_t revision;
   };
 
   /**
@@ -140,7 +168,12 @@ class CMD {
    * @brief 获取当前控制模式
    * @return 当前控制模式
    */
-  Mode GetCtrlMode() const { return this->mode_; }
+  Mode GetCtrlMode() const { return GetControlSelection().mode; }
+
+  ControlSelection GetControlSelection() const {
+    const auto revision = control_revision_.load();
+    return {ModeForRevision(revision), revision};
+  }
 
   bool GetAIGimbalStatus() const {
     return this->data_[static_cast<size_t>(ControlSource::CTRL_SOURCE_AI)]
@@ -209,6 +242,7 @@ class CMD {
     Mode mode = Mode::CMD_OP_CTRL;
     bool rc_online = false;
     bool ai_chassis_online = false;
+    uint32_t control_revision = 0U;
   };
 
   /**
@@ -224,7 +258,7 @@ class CMD {
       const char* gimbal_cmd_topic_name = "gimbal_cmd",
       const char* launcher_cmd_topic_name = "launcher_cmd",
       const char* control_state_topic_name = "control_state")
-      : mode_(mode),
+      : control_revision_(static_cast<uint32_t>(mode)),
         chassis_data_tp_(LibXR::Topic::CreateTopic<ChassisCMD>(
             chassis_cmd_topic_name, nullptr, true)),
         gimbal_data_tp_(LibXR::Topic::CreateTopic<GimbalCMD>(
@@ -254,8 +288,10 @@ class CMD {
    */
   void SetCtrlMode(Mode mode) {
     if (mode != Mode::CMD_OP_CTRL && mode != Mode::CMD_AUTO_CTRL) return;
-    if (this->mode_ == mode) return;
-    this->mode_ = mode;
+    auto revision = control_revision_.load();
+    do {
+      if (ModeForRevision(revision) == mode) return;
+    } while (!control_revision_.compare_exchange_weak(revision, revision + 1U));
     ProcessAndPublish();
   }
 
@@ -270,7 +306,13 @@ class CMD {
   }
 
  private:
-  Mode mode_;
+  static Mode ModeForRevision(uint32_t revision) {
+    static_assert(static_cast<uint32_t>(Mode::CMD_OP_CTRL) == 0U &&
+                  static_cast<uint32_t>(Mode::CMD_AUTO_CTRL) == 1U);
+    return static_cast<Mode>(revision & 1U);
+  }
+
+  std::atomic<uint32_t> control_revision_;
   bool online_ = false;
   RCInputSource active_rc_input_ =
       RCInputSource::RC_INPUT_DR16; /* 当前活动遥控输入源 */
@@ -367,7 +409,8 @@ class CMD {
       this->cmd_event_.Active(CMD_EVENT_START_CTRL);
     }
 
-    if (this->mode_ == Mode::CMD_OP_CTRL) {
+    const auto selection = GetControlSelection();
+    if (selection.mode == Mode::CMD_OP_CTRL) {
       out_chassis = rc_data.chassis;
       out_chassis.fx_n = out_chassis.fy_n = out_chassis.mz_nm = 0.0F;
       out_chassis.ff_valid = false;
@@ -391,7 +434,8 @@ class CMD {
     this->gimbal_data_tp_.Publish(out_gimbal);
     this->chassis_data_tp_.Publish(out_chassis);
     this->fire_data_tp_.Publish(out_launcher);
-    ChassisControl control{out_chassis, mode_, online_, ai_data.chassis_online};
+    ChassisControl control{out_chassis, selection.mode, online_,
+                           ai_data.chassis_online, selection.revision};
     control_state_tp_.Publish(control);
   }
 };
