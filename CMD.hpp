@@ -57,7 +57,7 @@ inline constexpr char CONFIGURATION_FOLD_COMMAND_TOPIC[] =
 inline constexpr char CONFIGURATION_FEEDBACK_TOPIC[] = "configuration_feedback";
 inline constexpr uint32_t CONFIGURATION_COMMAND_TIMEOUT_MS = 100U;
 
-}
+}  // namespace Pldx
 
 /**
  * @class CMD
@@ -82,6 +82,7 @@ class CMD {
     RC_INPUT_DR16,
     RC_INPUT_VT13,
     RC_INPUT_REFEREE,
+    RC_INPUT_ET08A,
     RC_INPUT_NUM
   };
 
@@ -96,6 +97,16 @@ class CMD {
   struct ControlSelection {
     Mode mode;
     uint32_t revision;
+  };
+
+  enum class ChassisMotion : uint8_t { RELAX, FOLLOW, ROTOR };
+
+  struct RemoteControl {
+    bool enabled = false;
+    Mode chassis_mode = Mode::CMD_OP_CTRL;
+    Mode gimbal_mode = Mode::CMD_OP_CTRL;
+    ChassisMotion motion = ChassisMotion::RELAX;
+    bool folded = false;
   };
 
   /**
@@ -154,6 +165,7 @@ class CMD {
     bool chassis_online;       /* 底盘在线状态 */
     bool gimbal_online;        /* 云台在线状态 */
     ControlSource ctrl_source; /* 控制源 */
+    RemoteControl remote;
   } Data;
 
   /**
@@ -169,6 +181,20 @@ class CMD {
    * @return 当前控制模式
    */
   Mode GetCtrlMode() const { return GetControlSelection().mode; }
+
+  Mode GetGimbalCtrlMode() const {
+    return ModeForRevision(gimbal_control_revision_.load());
+  }
+
+  bool ChassisRelaxRequested() const {
+    const auto& remote =
+        data_[static_cast<size_t>(ControlSource::CTRL_SOURCE_RC)].remote;
+    return remote.enabled &&
+           (remote.motion == ChassisMotion::RELAX ||
+            (remote.chassis_mode == Mode::CMD_AUTO_CTRL &&
+             !data_[static_cast<size_t>(ControlSource::CTRL_SOURCE_AI)]
+                  .chassis_online));
+  }
 
   ControlSelection GetControlSelection() const {
     const auto revision = control_revision_.load();
@@ -186,6 +212,14 @@ class CMD {
    * @details 用于其他模块绑定事件或激活事件
    */
   LibXR::Event& GetEvent() { return cmd_event_; }
+
+  void RegisterRemoteInput(const LibXR::Callback<>& input) {
+    remote_input_ = input;
+  }
+
+  void UpdateRemoteInput() {
+    if (!remote_input_.Empty()) remote_input_.Run(false);
+  }
 
   /**
    * @brief 获取在线状态
@@ -243,6 +277,9 @@ class CMD {
     bool rc_online = false;
     bool ai_chassis_online = false;
     uint32_t control_revision = 0U;
+    bool explicit_requests = false;
+    ChassisMotion motion = ChassisMotion::RELAX;
+    bool folded_request = false;
   };
 
   /**
@@ -259,6 +296,7 @@ class CMD {
       const char* launcher_cmd_topic_name = "launcher_cmd",
       const char* control_state_topic_name = "control_state")
       : control_revision_(static_cast<uint32_t>(mode)),
+        gimbal_control_revision_(static_cast<uint32_t>(mode)),
         chassis_data_tp_(LibXR::Topic::CreateTopic<ChassisCMD>(
             chassis_cmd_topic_name, nullptr, true)),
         gimbal_data_tp_(LibXR::Topic::CreateTopic<GimbalCMD>(
@@ -288,10 +326,8 @@ class CMD {
    */
   void SetCtrlMode(Mode mode) {
     if (mode != Mode::CMD_OP_CTRL && mode != Mode::CMD_AUTO_CTRL) return;
-    auto revision = control_revision_.load();
-    do {
-      if (ModeForRevision(revision) == mode) return;
-    } while (!control_revision_.compare_exchange_weak(revision, revision + 1U));
+    UpdateSelection(control_revision_, mode);
+    UpdateSelection(gimbal_control_revision_, mode);
     ProcessAndPublish();
   }
 
@@ -306,6 +342,13 @@ class CMD {
   }
 
  private:
+  static void UpdateSelection(std::atomic<uint32_t>& selection, Mode mode) {
+    auto revision = selection.load();
+    do {
+      if (ModeForRevision(revision) == mode) return;
+    } while (!selection.compare_exchange_weak(revision, revision + 1U));
+  }
+
   static Mode ModeForRevision(uint32_t revision) {
     static_assert(static_cast<uint32_t>(Mode::CMD_OP_CTRL) == 0U &&
                   static_cast<uint32_t>(Mode::CMD_AUTO_CTRL) == 1U);
@@ -313,6 +356,7 @@ class CMD {
   }
 
   std::atomic<uint32_t> control_revision_;
+  std::atomic<uint32_t> gimbal_control_revision_;
   bool online_ = false;
   RCInputSource active_rc_input_ =
       RCInputSource::RC_INPUT_DR16; /* 当前活动遥控输入源 */
@@ -323,13 +367,14 @@ class CMD {
   std::array<Data, static_cast<size_t>(RCInputSource::RC_INPUT_NUM)>
       rc_input_data_{}; /* 各遥控输入源的数据 */
   std::array<uint32_t, static_cast<size_t>(RCInputSource::RC_INPUT_NUM)>
-      rc_input_seq_{};           /* 各遥控输入源的数据序号 */
+      rc_input_seq_{}; /* 各遥控输入源的数据序号 */
 
-  LibXR::Event cmd_event_; /* 事件处理器 */
+  LibXR::Event cmd_event_;       /* 事件处理器 */
   LibXR::Topic chassis_data_tp_; /* 底盘命令主题 */
   LibXR::Topic gimbal_data_tp_;  /* 云台命令主题 */
   LibXR::Topic fire_data_tp_;    /* 开火命令主题 */
   LibXR::Topic control_state_tp_;
+  LibXR::Callback<> remote_input_;
   /*--------------------------工具函数-------------------------------------------------*/
   static bool IsRCInputOnline(const Data& rc_data) {
     return rc_data.chassis_online;
@@ -388,11 +433,21 @@ class CMD {
       }
     }
 
+    for (size_t index = 0; index < rc_input_data_.size(); ++index) {
+      if (IsRCInputOnline(rc_input_data_[index])) {
+        active_rc_input_ = static_cast<RCInputSource>(index);
+        return rc_input_data_[index];
+      }
+    }
     return MakeOfflineRCData();
   }
 
   void ProcessAndPublish() {
     const Data rc_data = this->SelectRCData();
+    if (rc_data.remote.enabled) {
+      UpdateSelection(control_revision_, rc_data.remote.chassis_mode);
+      UpdateSelection(gimbal_control_revision_, rc_data.remote.gimbal_mode);
+    }
     const Data& ai_data =
         this->data_[static_cast<size_t>(ControlSource::CTRL_SOURCE_AI)];
     ChassisCMD out_chassis{};
@@ -410,32 +465,43 @@ class CMD {
     }
 
     const auto selection = GetControlSelection();
-    if (selection.mode == Mode::CMD_OP_CTRL) {
+    if (selection.mode == Mode::CMD_OP_CTRL || !ai_data.chassis_online) {
       out_chassis = rc_data.chassis;
       out_chassis.fx_n = out_chassis.fy_n = out_chassis.mz_nm = 0.0F;
       out_chassis.ff_valid = false;
-      out_launcher = rc_data.launcher;
-      out_gimbal = rc_data.gimbal;
     } else {
-      /* CMD_AUTO_CTRL */
+      out_chassis = ai_data.chassis;
+    }
+    if (GetGimbalCtrlMode() == Mode::CMD_OP_CTRL) {
+      out_gimbal = rc_data.gimbal;
+      out_launcher = rc_data.launcher;
+    } else {
       out_gimbal = ai_data.gimbal_online ? ai_data.gimbal : rc_data.gimbal;
-      if (ai_data.chassis_online) {
-        out_chassis = ai_data.chassis;
-      } else {
-        out_chassis = rc_data.chassis;
-        out_chassis.fx_n = out_chassis.fy_n = out_chassis.mz_nm = 0.0F;
-        out_chassis.ff_valid = false;
-      }
       // Vision and navigation have independent lifetimes. In automatic mode,
       // firing requires a live vision target plus both fire requests.
       out_launcher.isfire = ai_data.gimbal_online && ai_data.launcher.isfire &&
                             rc_data.launcher.isfire;
     }
+    if (rc_data.remote.enabled &&
+        rc_data.remote.motion == ChassisMotion::RELAX) {
+      out_chassis = {};
+    }
+    if (!online_) {
+      out_chassis = {};
+      out_gimbal = {};
+      out_launcher = {};
+    }
     this->gimbal_data_tp_.Publish(out_gimbal);
     this->chassis_data_tp_.Publish(out_chassis);
     this->fire_data_tp_.Publish(out_launcher);
-    ChassisControl control{out_chassis, selection.mode, online_,
-                           ai_data.chassis_online, selection.revision};
+    ChassisControl control{out_chassis,
+                           selection.mode,
+                           online_,
+                           ai_data.chassis_online,
+                           selection.revision,
+                           rc_data.remote.enabled,
+                           rc_data.remote.motion,
+                           rc_data.remote.folded};
     control_state_tp_.Publish(control);
   }
 };
