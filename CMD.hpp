@@ -218,7 +218,11 @@ class CMD {
   }
 
   void UpdateRemoteInput() {
-    if (!remote_input_.Empty()) remote_input_.Run(false);
+    if (remote_input_.Empty()) return;
+    remote_batch_active_.store(true);
+    remote_input_.Run(false);
+    remote_batch_active_.store(false);
+    ProcessAndPublish();
   }
 
   /**
@@ -375,6 +379,7 @@ class CMD {
   LibXR::Topic fire_data_tp_;    /* 开火命令主题 */
   LibXR::Topic control_state_tp_;
   LibXR::Callback<> remote_input_;
+  std::atomic<bool> remote_batch_active_{false};
   /*--------------------------工具函数-------------------------------------------------*/
   static bool IsRCInputOnline(const Data& rc_data) {
     return rc_data.chassis_online;
@@ -491,6 +496,7 @@ class CMD {
       out_gimbal = {};
       out_launcher = {};
     }
+    if (remote_batch_active_.load()) return;
     this->gimbal_data_tp_.Publish(out_gimbal);
     this->chassis_data_tp_.Publish(out_chassis);
     this->fire_data_tp_.Publish(out_launcher);
