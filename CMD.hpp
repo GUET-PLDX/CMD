@@ -372,6 +372,7 @@ class CMD {
       rc_input_data_{}; /* 各遥控输入源的数据 */
   std::array<uint32_t, static_cast<size_t>(RCInputSource::RC_INPUT_NUM)>
       rc_input_seq_{}; /* 各遥控输入源的数据序号 */
+  std::atomic<bool> remote_batch_active_{false};
 
   LibXR::Event cmd_event_;       /* 事件处理器 */
   LibXR::Topic chassis_data_tp_; /* 底盘命令主题 */
@@ -379,7 +380,6 @@ class CMD {
   LibXR::Topic fire_data_tp_;    /* 开火命令主题 */
   LibXR::Topic control_state_tp_;
   LibXR::Callback<> remote_input_;
-  std::atomic<bool> remote_batch_active_{false};
   /*--------------------------工具函数-------------------------------------------------*/
   static bool IsRCInputOnline(const Data& rc_data) {
     return rc_data.chassis_online;
