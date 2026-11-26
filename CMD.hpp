@@ -80,10 +80,8 @@ class CMD {
    * @brief 遥控链路输入源枚举
    */
   enum class RCInputSource : uint8_t {
-    RC_INPUT_DR16,
-    RC_INPUT_VT13,
-    RC_INPUT_REFEREE,
     RC_INPUT_ET08A,
+    RC_INPUT_REFEREE,
     RC_INPUT_NUM
   };
 
@@ -213,10 +211,10 @@ class CMD {
 
   /**
    * @brief 写入遥控器控制数据并同步发布
-   * @details 兼容接口，默认按DR16输入源写入
+   * @details 默认按 ET08A 输入源写入
    */
   void FeedRC(const Data& rc_data) {
-    this->FeedRC(RCInputSource::RC_INPUT_DR16, rc_data);
+    this->FeedRC(RCInputSource::RC_INPUT_ET08A, rc_data);
   }
 
   /**
@@ -349,7 +347,7 @@ class CMD {
   std::atomic<bool> chassis_relax_requested_{false};
   std::atomic<bool> ai_gimbal_online_{false};
   RCInputSource active_rc_input_ =
-      RCInputSource::RC_INPUT_DR16; /* 当前活动遥控输入源 */
+      RCInputSource::RC_INPUT_ET08A; /* 当前活动遥控输入源 */
   uint32_t rc_update_seq_ = 0;      /* 遥控输入数据更新序号 */
 
   std::array<Data, static_cast<size_t>(ControlSource::CTRL_SOURCE_NUM)>
@@ -392,8 +390,6 @@ class CMD {
   }
 
   Data SelectRCData() {
-    const auto dr16_index = static_cast<size_t>(RCInputSource::RC_INPUT_DR16);
-    const auto vt13_index = static_cast<size_t>(RCInputSource::RC_INPUT_VT13);
     const auto active_index = static_cast<size_t>(this->active_rc_input_);
 
     // 当前活动源在线则持续使用
@@ -402,27 +398,7 @@ class CMD {
       return this->rc_input_data_[active_index];
     }
 
-    // 活动源离线后切换
-    if (this->active_rc_input_ == RCInputSource::RC_INPUT_DR16) {
-      if (this->IsRCInputOnline(this->rc_input_data_[vt13_index])) {
-        this->active_rc_input_ = RCInputSource::RC_INPUT_VT13;
-        return this->rc_input_data_[vt13_index];
-      }
-      if (this->IsRCInputOnline(this->rc_input_data_[dr16_index])) {
-        this->active_rc_input_ = RCInputSource::RC_INPUT_DR16;
-        return this->rc_input_data_[dr16_index];
-      }
-    } else {
-      if (this->IsRCInputOnline(this->rc_input_data_[dr16_index])) {
-        this->active_rc_input_ = RCInputSource::RC_INPUT_DR16;
-        return this->rc_input_data_[dr16_index];
-      }
-      if (this->IsRCInputOnline(this->rc_input_data_[vt13_index])) {
-        this->active_rc_input_ = RCInputSource::RC_INPUT_VT13;
-        return this->rc_input_data_[vt13_index];
-      }
-    }
-
+    // 活动源离线后寻找在线输入，优先检查 ET08A。
     for (size_t index = 0; index < rc_input_data_.size(); ++index) {
       if (IsRCInputOnline(rc_input_data_[index])) {
         active_rc_input_ = static_cast<RCInputSource>(index);
