@@ -19,8 +19,8 @@ ET08A 的 `Data::remote` 在同一帧中携带底盘与云台独立权限、RELA
 | launcher_cmd | LauncherCMD | 开火许可 |
 | control_state | ChassisControl | 同次仲裁的底盘命令、权限、在线状态、显式构型与运动请求 |
 
-ET08A 使用 `RegisterRemoteInput()` 注册唯一的遥控交接回调，Gimbal 在每周期入口调用 `UpdateRemoteInput()`。串口线程只在 ET08A 内排队，由云台控制任务提交 CMD 和执行 SC 事件，避免串口线程在控制计算中途重置模式。模块与 CMD 须具有应用全生命周期，初始化后不重新注册回调。该入口不改变其他既有输入模块的执行方式。
+各输入线程直接调用 Feed 接口；CMD 使用互斥锁串行化写入、仲裁和 Topic 发布。在线状态、视觉在线状态及底盘卸力请求通过原子值提供给控制任务。同步事件与 Topic 回调中可以读取状态，不得递归调用 Feed 或 SetCtrlMode；回调不得持锁回写 CMD。
 
-遥控交接作用域内保留在线／失控和 SC 状态事件，暂缓命令 Topic 发布，结束时仅发布最终仲裁结果。Gimbal 在交接前消费并重新挂起上一条命令订阅，再读取本周期最终结果，避免异步订阅保留首帧而使指令与最终控制模式不一致。
+ET08A 在 UART 线程解析输入并触发 SC 事件。Gimbal 以互斥锁保护模式进入动作和控制计算，通过包含命令、控制权与视觉在线状态的同次仲裁快照消费输入；不再使用遥控消费回调或批量发布作用域。
 
 主机集成测试位于 BSP 的 tools/tests/et08a 和 tools/tests/gimbal_autoaim，覆盖独立权限、发射许可、失控恢复与真实控制输出。

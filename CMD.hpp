@@ -21,6 +21,7 @@ depends: []
 #include "event.hpp"
 #include "libxr_def.hpp"
 #include "message.hpp"
+#include "mutex.hpp"
 
 namespace Pldx {
 
@@ -136,7 +137,7 @@ class CMD {
    * @details 遥控 yaw/pit 为归一化输入，由云台按控制周期积分；
    *          AI yaw/pit 为绝对角，导数使用 rad/s 和 rad/s^2。
    */
-  typedef struct {
+  typedef struct GimbalCMD {
     float yaw;      /* 遥控归一化输入 / AI 偏航角 rad */
     float pit;      /* 遥控归一化输入 / AI 俯仰角 rad */
     float rol;      /* 翻滚角设定值，单位 rad */
@@ -146,6 +147,8 @@ class CMD {
     float pit_ddot; /* pit 角加速度，单位 rad/s^2 */
     float rol_dot;  /* roll 角速度，单位 rad/s */
     float rol_ddot; /* roll 角加速度，单位 rad/s^2 */
+    Mode control_mode = Mode::CMD_OP_CTRL; /* 同次仲裁的输入解释方式 */
+    bool ai_online = false;      /* 同次仲裁的视觉在线状态 */
   } GimbalCMD;
 
   /**
@@ -186,25 +189,14 @@ class CMD {
     return ModeForRevision(gimbal_control_revision_.load());
   }
 
-  bool ChassisRelaxRequested() const {
-    const auto& remote =
-        data_[static_cast<size_t>(ControlSource::CTRL_SOURCE_RC)].remote;
-    return remote.enabled &&
-           (remote.motion == ChassisMotion::RELAX ||
-            (remote.chassis_mode == Mode::CMD_AUTO_CTRL &&
-             !data_[static_cast<size_t>(ControlSource::CTRL_SOURCE_AI)]
-                  .chassis_online));
-  }
+  bool ChassisRelaxRequested() const { return chassis_relax_requested_.load(); }
 
   ControlSelection GetControlSelection() const {
     const auto revision = control_revision_.load();
     return {ModeForRevision(revision), revision};
   }
 
-  bool GetAIGimbalStatus() const {
-    return this->data_[static_cast<size_t>(ControlSource::CTRL_SOURCE_AI)]
-        .gimbal_online;
-  }
+  bool GetAIGimbalStatus() const { return ai_gimbal_online_.load(); }
 
   /**
    * @brief 获取CMD模块的事件处理器
@@ -212,18 +204,6 @@ class CMD {
    * @details 用于其他模块绑定事件或激活事件
    */
   LibXR::Event& GetEvent() { return cmd_event_; }
-
-  void RegisterRemoteInput(const LibXR::Callback<>& input) {
-    remote_input_ = input;
-  }
-
-  void UpdateRemoteInput() {
-    if (remote_input_.Empty()) return;
-    remote_batch_active_.store(true);
-    remote_input_.Run(false);
-    remote_batch_active_.store(false);
-    ProcessAndPublish();
-  }
 
   /**
    * @brief 获取在线状态
@@ -243,6 +223,7 @@ class CMD {
    * @brief 按遥控输入源写入控制数据并同步发布
    */
   void FeedRC(RCInputSource source, const Data& rc_data) {
+    LibXR::Mutex::LockGuard guard(input_mutex_);
     const auto source_index = static_cast<size_t>(source);
     if (source_index >= static_cast<size_t>(RCInputSource::RC_INPUT_NUM)) {
       return;
@@ -258,6 +239,7 @@ class CMD {
 
   /** 分片更新 AI 底盘命令，供导航等独立来源与视觉来源合并提交。 */
   void FeedAIChassis(const Data& ai_data) {
+    LibXR::Mutex::LockGuard guard(input_mutex_);
     auto& slot =
         this->data_[static_cast<size_t>(ControlSource::CTRL_SOURCE_AI)];
     slot.chassis = ai_data.chassis;
@@ -267,6 +249,7 @@ class CMD {
 
   /** 分片更新 AI 云台与发射命令，供视觉来源与导航来源合并提交。 */
   void FeedAIGimbal(const Data& ai_data) {
+    LibXR::Mutex::LockGuard guard(input_mutex_);
     auto& slot =
         this->data_[static_cast<size_t>(ControlSource::CTRL_SOURCE_AI)];
     slot.gimbal = ai_data.gimbal;
@@ -329,6 +312,7 @@ class CMD {
    * @details 有效模式变化时立即更新状态、重新仲裁并发布
    */
   void SetCtrlMode(Mode mode) {
+    LibXR::Mutex::LockGuard guard(input_mutex_);
     if (mode != Mode::CMD_OP_CTRL && mode != Mode::CMD_AUTO_CTRL) return;
     UpdateSelection(control_revision_, mode);
     UpdateSelection(gimbal_control_revision_, mode);
@@ -361,7 +345,9 @@ class CMD {
 
   std::atomic<uint32_t> control_revision_;
   std::atomic<uint32_t> gimbal_control_revision_;
-  bool online_ = false;
+  std::atomic<bool> online_{false};
+  std::atomic<bool> chassis_relax_requested_{false};
+  std::atomic<bool> ai_gimbal_online_{false};
   RCInputSource active_rc_input_ =
       RCInputSource::RC_INPUT_DR16; /* 当前活动遥控输入源 */
   uint32_t rc_update_seq_ = 0;      /* 遥控输入数据更新序号 */
@@ -372,14 +358,13 @@ class CMD {
       rc_input_data_{}; /* 各遥控输入源的数据 */
   std::array<uint32_t, static_cast<size_t>(RCInputSource::RC_INPUT_NUM)>
       rc_input_seq_{}; /* 各遥控输入源的数据序号 */
-  std::atomic<bool> remote_batch_active_{false};
 
-  LibXR::Event cmd_event_;       /* 事件处理器 */
+  LibXR::Mutex input_mutex_; /* 串行化各输入线程的仲裁和发布 */
+  LibXR::Event cmd_event_;   /* 事件处理器 */
   LibXR::Topic chassis_data_tp_; /* 底盘命令主题 */
   LibXR::Topic gimbal_data_tp_;  /* 云台命令主题 */
   LibXR::Topic fire_data_tp_;    /* 开火命令主题 */
   LibXR::Topic control_state_tp_;
-  LibXR::Callback<> remote_input_;
   /*--------------------------工具函数-------------------------------------------------*/
   static bool IsRCInputOnline(const Data& rc_data) {
     return rc_data.chassis_online;
@@ -455,6 +440,12 @@ class CMD {
     }
     const Data& ai_data =
         this->data_[static_cast<size_t>(ControlSource::CTRL_SOURCE_AI)];
+    chassis_relax_requested_.store(
+        rc_data.remote.enabled &&
+        (rc_data.remote.motion == ChassisMotion::RELAX ||
+         (rc_data.remote.chassis_mode == Mode::CMD_AUTO_CTRL &&
+          !ai_data.chassis_online)));
+    ai_gimbal_online_.store(ai_data.gimbal_online);
     ChassisCMD out_chassis{};
     GimbalCMD out_gimbal{};
     LauncherCMD out_launcher{};
@@ -496,7 +487,8 @@ class CMD {
       out_gimbal = {};
       out_launcher = {};
     }
-    if (remote_batch_active_.load()) return;
+    out_gimbal.control_mode = GetGimbalCtrlMode();
+    out_gimbal.ai_online = ai_data.gimbal_online;
     this->gimbal_data_tp_.Publish(out_gimbal);
     this->chassis_data_tp_.Publish(out_chassis);
     this->fire_data_tp_.Publish(out_launcher);
